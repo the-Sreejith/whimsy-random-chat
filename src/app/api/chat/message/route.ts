@@ -1,4 +1,3 @@
-// src/app/api/chat/message/route.ts
 import { NextResponse } from 'next/server';
 import { createSupabaseServerClient } from '@/lib/supabase/server';
 
@@ -17,24 +16,25 @@ export async function POST(request: Request) {
             .from('chat_messages')
             .insert({
                 room_id: roomId,
-                sender_id: userId, // Sender is the actual user
-                message: text.trim(), // Trim whitespace
+                sender_id: userId,
+                message: text.trim(),
                 is_system: false,
             });
 
         if (error) {
             console.error(`API Error [/api/chat/message]: Failed to insert message for room ${roomId} by ${userId}`, error);
+            // Check for RLS violation specifically
+             if (error.code === '42501') { // permission denied
+                return NextResponse.json({ success: false, message: 'Permission denied. You might not be in this room anymore.' }, { status: 403 });
+             }
             return NextResponse.json({ success: false, message: 'Failed to send message.', error: error.message }, { status: 500 });
         }
 
-        // Message insertion will trigger Supabase Realtime for connected clients
-        // No need to broadcast from here.
         console.log(`API [/message]: Message from ${userId} inserted into room ${roomId}`);
         return NextResponse.json({ success: true, message: 'Message sent.' }, { status: 200 });
 
     } catch (error: any) {
         console.error("API Error [/api/chat/message]:", error);
-        // Check if the error is due to JSON parsing
          if (error instanceof SyntaxError) {
              return NextResponse.json({ message: 'Invalid JSON payload.' }, { status: 400 });
          }

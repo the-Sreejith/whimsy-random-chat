@@ -1,18 +1,16 @@
-import { Message } from "@/types/chat"; // Ensure this path is correct
+import { Message } from "@/types/chat";
 import { cn } from "@/lib/utils";
 import { format } from "date-fns";
 
 interface ChatMessageProps {
-  message: Message; // Use the Message type from types/chat
+  message: Message;
 }
 
 const ChatMessage = ({ message }: ChatMessageProps) => {
-  // Defensively check timestamp validity before formatting
   const timestamp = message.timestamp && !isNaN(message.timestamp)
     ? format(new Date(message.timestamp), "HH:mm")
     : '--:--';
 
-  // Handle system messages
   if (message.system) {
     return (
       <div className="flex justify-center my-2 animate-fade-in">
@@ -23,23 +21,22 @@ const ChatMessage = ({ message }: ChatMessageProps) => {
     );
   }
 
-  // Handle regular user messages
   const isMe = message.sender === "me";
 
   return (
     <div className={cn(
-      "flex mb-2 animate-slide-in", // Reduced margin-bottom slightly
+      "flex mb-2 animate-slide-in",
       isMe ? "justify-end" : "justify-start"
     )}>
       <div className={cn(
-        "max-w-[75%] px-3 py-1.5 rounded-xl break-words shadow-sm", // Adjusted padding and roundedness
+        "max-w-[75%] px-3 py-1.5 rounded-xl break-words shadow-sm",
         isMe
           ? "bg-primary text-primary-foreground rounded-br-none"
-          : "bg-secondary dark:bg-gray-700 text-secondary-foreground dark:text-gray-200 rounded-tl-none" // Adjusted background for dark mode
+          : "bg-secondary dark:bg-gray-700 text-secondary-foreground dark:text-gray-200 rounded-tl-none"
       )}>
-        <div className="text-sm">{message.text}</div> {/* Explicitly set text size */}
+        <div className="text-sm">{message.text}</div>
         <div className={cn(
-          "text-[10px] mt-0.5 text-right opacity-70", // Adjusted margin and opacity
+          "text-[10px] mt-0.5 text-right opacity-70",
            isMe ? "text-primary-foreground/70" : "text-muted-foreground"
         )}>
           {timestamp}

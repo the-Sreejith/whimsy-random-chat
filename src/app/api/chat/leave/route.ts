@@ -1,54 +1,46 @@
-// src/app/api/chat/leave/route.ts
 import { NextResponse } from 'next/server';
 import { createSupabaseServerClient } from '@/lib/supabase/server';
+import type { SupabaseClient } from '@supabase/supabase-js';
+import type { Database } from '@/types/supabase';
 
-// --- Adapted Service Logic ---
-async function removeUserFromRoom(supabase: ReturnType<typeof createSupabaseServerClient>, roomId: string, userId: string) {
-    console.log(`API [/leave]: Removing participant ${userId} from room ${roomId}...`);
+// --- Reused Helper: Remove User ---
+async function removeUserFromRoom(supabase: SupabaseClient<Database>, roomId: string, userId: string) {
+    console.log(`API [/leave -> removeUser]: Removing participant ${userId} from room ${roomId}...`);
 
-    // 1. Post "disconnected" message *before* deleting participant (so they might receive it)
-    // This relies on Realtime being slightly faster than the delete operation completing.
-    // Targeting isn't strictly necessary if RLS prevents the leaving user seeing it after removal.
-    await supabase.from('chat_messages').insert({
-        room_id: roomId,
-        sender_id: 'system',
-        message: `${userId} has disconnected.`, // Use a generic ID or alias if desired
-        is_system: true
-    });
-
-    // 2. Delete the participant
+    // Delete participant first
     const { error: deleteError } = await supabase
         .from('chat_participants')
         .delete()
         .eq('user_id', userId)
         .eq('room_id', roomId);
 
-    if (deleteError) {
-        console.error(`API [/leave]: Error removing participant ${userId} from room ${roomId}:`, deleteError);
-        // Don't throw here, maybe the user was already gone. Log it.
-        return false; // Indicate potential issue
-    }
-     console.log(`API [/leave]: Participant ${userId} deleted from room ${roomId}.`);
+     if (deleteError) {
+        console.error(`API [/leave -> removeUser]: Error removing participant ${userId} from room ${roomId}:`, deleteError);
+         // Don't throw, let cleanup proceed if possible
+     } else {
+        console.log(`API [/leave -> removeUser]: Participant ${userId} deleted from room ${roomId}.`);
+     }
 
-    // 3. Check if room is empty and clean up (optional but recommended)
+    // Optional: Check if room is empty and clean up
     const { data: remaining, error: countError } = await supabase
         .from('chat_participants')
-        .select('id', { count: 'exact' })
+        .select('id', { count: 'exact', head: true })
         .eq('room_id', roomId);
 
-    if (!countError && remaining && remaining.length === 0) {
-         console.log(`API [/leave]: Room ${roomId} is empty after ${userId} left. Deleting room and messages...`);
-         // Best effort cleanup
+    if (!countError && remaining?.length === 0) {
+         console.log(`API [/leave -> removeUser]: Room ${roomId} is empty. Deleting room.`);
          await supabase.from('chat_messages').delete().eq('room_id', roomId);
          await supabase.from('chat_rooms').delete().eq('id', roomId);
-         console.log(`API [/leave]: Empty room ${roomId} cleanup attempted.`);
+         console.log(`API [/leave -> removeUser]: Empty room ${roomId} cleanup attempted.`);
     } else if (countError) {
-         console.error(`API [/leave]: Error counting remaining participants in room ${roomId}:`, countError);
+         console.error(`API [/leave -> removeUser]: Error counting remaining participants in room ${roomId}:`, countError);
     }
 
-    return true; // Participant delete itself was successful or didn't error
+    // Return true if delete didn't error, false otherwise (for potential different status code)
+    return !deleteError;
 }
-// --- End Adapted Service Logic ---
+// --- End Helper ---
+
 
 export async function POST(request: Request) {
     try {
@@ -62,16 +54,12 @@ export async function POST(request: Request) {
         const supabase = createSupabaseServerClient();
         const success = await removeUserFromRoom(supabase, roomId, userId);
 
-        // The removal itself triggers Realtime events for participant changes.
+        // Realtime handles notifying partner via participant change subscription
         if (success) {
             return NextResponse.json({ success: true, message: 'Successfully left the chat.' }, { status: 200 });
         } else {
-            // This might mean the delete failed, or just the cleanup check failed.
-            // The user might already be gone. Return success anyway from client perspective?
-             // Let's return success as the intent is likely fulfilled client-side.
-             return NextResponse.json({ success: true, message: 'Leave request processed.' }, { status: 200 });
-            // Or return a different status if needed:
-            // return NextResponse.json({ success: false, message: 'Could not confirm leave operation or room cleanup failed.' }, { status: 500 });
+             // Even if delete failed (e.g., user already gone), client likely considers it success
+             return NextResponse.json({ success: true, message: 'Leave request processed (user might have already left).' }, { status: 200 });
         }
 
     } catch (error: any) {

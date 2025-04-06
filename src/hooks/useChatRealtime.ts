@@ -1,5 +1,4 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { toast } from "sonner";
 import type {
     RealtimeChannel,
     RealtimePresenceState,
@@ -7,43 +6,25 @@ import type {
     REALTIME_SUBSCRIBE_STATES,
     SupabaseClient
 } from "@supabase/supabase-js";
-import type { Message } from "@/types/chat"; // Assuming Message type is defined here
+import type { Database } from '@/types/supabase';
+import type { SignalingMessage } from "@/types/chat";
 
-// Define interfaces for your database table structures used in Realtime payloads
-// Replace with actual column names and types from your Supabase schema
-interface ChatMessagePayload {
-    id: string; // Assuming UUID in DB corresponds to string
-    created_at: string; // ISO timestamp string
-    room_id: string;
-    sender_id: string;
-    message: string;
-    is_system?: boolean; // Optional system flag
-    target_user_id?: string | null; // Optional target user
-    // Add other relevant fields from your chat_messages table
-}
-
-interface ChatParticipantPayload {
-    id: number; // Or whatever the primary key type is
-    room_id: string;
-    user_id: string;
-    joined_at: string;
-    // Add other relevant fields from your chat_participants table
-}
+type ChatMessagePayload = Database['public']['Tables']['chat_messages']['Row'];
+type ChatParticipantPayload = Database['public']['Tables']['chat_participants']['Row'];
 
 interface PresencePayload {
     is_typing: boolean;
     user_id: string;
-    // Add any other presence info you track
 }
 
 interface UseChatRealtimeProps {
-    supabase: SupabaseClient | null; // Allow null initially
+    supabase: SupabaseClient<Database> | null;
     roomId: string | null;
     userId: string;
     onNewMessage: (text: string, sender: "stranger" | "system", msgId: string, timestamp: number) => void;
-    onSystemMessage: (text: string) => void;
-    onPartnerJoined: () => void;
+    onPartnerJoined: (partnerId: string) => void;
     onPartnerLeft: () => void;
+    onSignalingMessage: (payload: SignalingMessage) => void;
     onSubscriptionError: (context: string, error: Error) => void;
 }
 
@@ -52,39 +33,31 @@ export function useChatRealtime({
     roomId,
     userId,
     onNewMessage,
-    onSystemMessage,
     onPartnerJoined,
     onPartnerLeft,
+    onSignalingMessage,
     onSubscriptionError,
 }: UseChatRealtimeProps) {
     const [isPartnerTyping, setIsPartnerTyping] = useState(false);
 
-    const messageChannel = useRef<RealtimeChannel | null>(null);
-    const participantChannel = useRef<RealtimeChannel | null>(null);
-    const presenceChannel = useRef<RealtimeChannel | null>(null);
+    const mainChannel = useRef<RealtimeChannel | null>(null);
     const typingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
     const cleanupSubscriptions = useCallback(async () => {
         if (!supabase) return;
-        const channels = [messageChannel.current, participantChannel.current, presenceChannel.current];
         console.log("Realtime: Cleaning up subscriptions...");
 
-        for (const channel of channels) {
-            if (channel) {
-                try {
-                    if (['joined', 'joining'].includes(channel.state)) {
-                        await channel.unsubscribe();
-                        console.log(`Realtime: Unsubscribed from ${channel.topic}`);
-                    } else {
-                        console.log(`Realtime: Channel ${channel.topic} state is ${channel.state}, no need to unsubscribe.`);
-                    }
-                } catch (error) {
-                    console.error(`Realtime: Error unsubscribing from ${channel.topic}:`, error);
+        if (mainChannel.current) {
+            try {
+                if (['joined', 'joining'].includes(mainChannel.current.state)) {
+                    await mainChannel.current.unsubscribe();
+                    console.log(`Realtime: Unsubscribed from ${mainChannel.current.topic}`);
                 }
+            } catch (error) {
+                console.error(`Realtime: Error unsubscribing from ${mainChannel.current.topic}:`, error);
             }
         }
 
-        // Remove all tracked channels for robustness (optional but good)
         try {
             await supabase.removeAllChannels();
              console.log("Realtime: Removed all channels from Supabase client.");
@@ -92,11 +65,9 @@ export function useChatRealtime({
              console.error("Realtime: Error removing all channels:", error);
         }
 
-        messageChannel.current = null;
-        participantChannel.current = null;
-        presenceChannel.current = null;
-        setIsPartnerTyping(false); // Reset typing status on cleanup
-         if (typingTimeoutRef.current) { // Clear any pending typing timeout
+        mainChannel.current = null;
+        setIsPartnerTyping(false);
+         if (typingTimeoutRef.current) {
              clearTimeout(typingTimeoutRef.current);
              typingTimeoutRef.current = null;
          }
@@ -105,114 +76,97 @@ export function useChatRealtime({
 
 
     useEffect(() => {
-        if (!roomId || !supabase) {
+        if (!roomId || !supabase || !userId) {
             cleanupSubscriptions();
             return;
         }
 
-        console.log(`Realtime: Setting up subscriptions for Room: ${roomId}`);
+        console.log(`Realtime: Setting up main channel for Room: ${roomId}`);
 
-        // --- Message Subscription ---
-        messageChannel.current = supabase.channel(`chat_messages:${roomId}`)
+        mainChannel.current = supabase.channel(`room:${roomId}`, {
+            config: {
+                presence: { key: userId },
+                broadcast: { self: false, ack: true }
+            }
+        });
+
+        const handleIncomingBroadcast = (event: { type: string, payload: any }) => {
+             console.log(`Realtime: Received broadcast event '${event.type}'`);
+             switch (event.type) {
+                case 'video-offer':
+                case 'video-answer':
+                case 'ice-candidate':
+                    onSignalingMessage(event.payload as SignalingMessage);
+                    break;
+                case 'partner_left': // Optional direct message if needed
+                    // onPartnerLeft(); // Usually handled by participant changes
+                    break;
+                default:
+                    console.warn(`Realtime: Unknown broadcast event type: ${event.type}`);
+            }
+        };
+
+        mainChannel.current
             .on<ChatMessagePayload>(
                 'postgres_changes',
                 { event: 'INSERT', schema: 'public', table: 'chat_messages', filter: `room_id=eq.${roomId}` },
-                (payload: RealtimePostgresChangesPayload<ChatMessagePayload>) => {
+                (payload) => {
                     console.log('Realtime: New message payload received:', payload.new);
                     const newMessage = payload.new as ChatMessagePayload;
                     if (newMessage && newMessage.sender_id !== userId) {
-                         // Ignore if targeted and not for me
-                         if (newMessage.target_user_id && newMessage.target_user_id !== userId) {
-                             console.log(`Realtime: Ignoring targeted message ${newMessage.id} not for user ${userId}`);
-                             return;
-                         }
                         const senderType = newMessage.is_system ? "system" : "stranger";
                         onNewMessage(
-                            newMessage.message,
+                            newMessage.message ?? '',
                             senderType,
                             newMessage.id,
                             new Date(newMessage.created_at).getTime()
                         );
-                        // If stranger sent a message, they are not typing
                         if (senderType === 'stranger') {
                             setIsPartnerTyping(false);
                         }
                     }
                 }
             )
-            .subscribe((status: REALTIME_SUBSCRIBE_STATES, err?: Error) => {
-                 if (status === 'SUBSCRIBED') {
-                      console.log(`Realtime: Subscribed to messages for room ${roomId}`);
-                 } else if (err) {
-                      console.error(`Realtime: Message subscription error for ${roomId}:`, err);
-                      onSubscriptionError("Could not listen for new messages", err);
-                 }
-            });
-
-        // --- Participant Subscription ---
-        participantChannel.current = supabase.channel(`chat_participants:${roomId}`)
             .on<ChatParticipantPayload>(
-                'postgres_changes',
-                { event: '*', schema: 'public', table: 'chat_participants', filter: `room_id=eq.${roomId}` },
-                async (payload: RealtimePostgresChangesPayload<ChatParticipantPayload>) => {
-                    console.log('Realtime: Participant change payload:', payload);
+                 'postgres_changes',
+                 { event: '*', schema: 'public', table: 'chat_participants', filter: `room_id=eq.${roomId}` },
+                 async (payload) => {
+                     console.log('Realtime: Participant change payload:', payload);
+                     const { count, error } = await supabase
+                          .from('chat_participants')
+                          .select('user_id', { count: 'exact', head: false }) // Fetch user IDs
+                          .eq('room_id', roomId);
 
-                    // Fetch count *after* event payload is processed for more accuracy
-                    const { count, error } = await supabase
-                         .from('chat_participants')
-                         .select('*', { count: 'exact', head: true })
-                         .eq('room_id', roomId);
+                     if (error) {
+                         console.error("Realtime: Error fetching participants:", error);
+                         return;
+                     }
 
-                    if (error) {
-                        console.error("Realtime: Error fetching participant count:", error);
-                        return; // Or call onSubscriptionError?
-                    }
-                    console.log(`Realtime: Participant count for room ${roomId} is now ${count}`);
+                     const participants = count || [];
+                     const partner = participants.find(p => p.user_id !== userId);
 
-                    if (payload.eventType === 'INSERT') {
-                        const joinedUserId = payload.new.user_id;
-                         // Check if *another* user joined and now there are exactly 2
-                         if (joinedUserId !== userId && count === 2) {
-                             console.log(`Realtime: Partner (${joinedUserId}) joined room ${roomId}.`);
-                             onPartnerJoined();
+                     if (payload.eventType === 'INSERT') {
+                         const joinedUserId = payload.new.user_id;
+                          if (joinedUserId !== userId && participants.length === 2 && partner) {
+                              console.log(`Realtime: Partner (${partner.user_id}) joined room ${roomId}.`);
+                              onPartnerJoined(partner.user_id);
+                          }
+                     } else if (payload.eventType === 'DELETE') {
+                         const leftUserId = payload.old?.user_id;
+                         if (leftUserId && leftUserId !== userId) {
+                              console.log(`Realtime: Partner (${leftUserId}) left room ${roomId}.`);
+                              onPartnerLeft();
+                              setIsPartnerTyping(false);
                          }
-                    } else if (payload.eventType === 'DELETE') {
-                        const leftUserId = payload.old?.user_id; // Use optional chaining
-                        if (leftUserId && leftUserId !== userId) {
-                             console.log(`Realtime: Partner (${leftUserId}) left room ${roomId}.`);
-                             onPartnerLeft();
-                             setIsPartnerTyping(false); // Partner left, they can't be typing
-                             // No need to cleanup here, the main effect handles roomId changes
-                        }
-                    }
-                }
-            )
-             .subscribe((status: REALTIME_SUBSCRIBE_STATES, err?: Error) => {
-                 if (status === 'SUBSCRIBED') {
-                      console.log(`Realtime: Subscribed to participants for room ${roomId}`);
-                 } else if (err) {
-                      console.error(`Realtime: Participant subscription error for ${roomId}:`, err);
-                       onSubscriptionError("Could not monitor chat participants", err);
+                     }
                  }
-            });
-
-         // --- Presence (Typing Indicator) Subscription ---
-         presenceChannel.current = supabase.channel(`typing:${roomId}`, {
-              config: {
-                  presence: {
-                      key: userId, // Unique key for this user's presence
-                  },
-              },
-         });
-
-         presenceChannel.current
-              .on('presence', { event: 'sync' }, () => {
-                  const newState: RealtimePresenceState<PresencePayload> = presenceChannel.current!.presenceState();
-                  // console.log('Realtime: Presence sync', newState);
+             )
+            .on('presence', { event: 'sync' }, () => {
+                  const newState: RealtimePresenceState<PresencePayload> = mainChannel.current!.presenceState();
                   let partnerIsCurrentlyTyping = false;
                   for (const id in newState) {
                        if (id !== userId) {
-                           const userPresence = newState[id]?.[0]; // Get the first presence state for the user
+                           const userPresence = newState[id]?.[0];
                            if (userPresence?.is_typing) {
                                partnerIsCurrentlyTyping = true;
                                break;
@@ -223,44 +177,37 @@ export function useChatRealtime({
                      setIsPartnerTyping(partnerIsCurrentlyTyping);
                   }
                })
-               .on('presence', { event: 'leave' }, ({ key }) => {
-                   // console.log('Realtime: Presence leave', key);
+            .on('presence', { event: 'leave' }, ({ key }) => {
                    if (key !== userId) {
-                       // Partner's presence record left, ensure typing is false
                        setIsPartnerTyping(false);
                    }
                })
-               .subscribe(async (status: REALTIME_SUBSCRIBE_STATES, err?: Error) => {
-                   if (status === 'SUBSCRIBED') {
-                       console.log(`Realtime: Subscribed to presence for room ${roomId}. Tracking self.`);
-                       // Track initial state (not typing)
-                       try {
-                            const trackStatus = await presenceChannel.current?.track({ is_typing: false, user_id: userId } as PresencePayload);
-                            // console.log('Realtime: Initial presence track status:', trackStatus);
-                       } catch (trackError: any) {
-                           console.error("Realtime: Error tracking initial presence:", trackError);
-                           onSubscriptionError("Could not set up typing indicators", trackError);
-                       }
-                   } else if (err) {
-                      console.error(`Realtime: Presence subscription error for ${roomId}:`, err);
-                       onSubscriptionError("Could not set up typing indicators", err);
-                   }
-               });
+             .on('broadcast', { event: 'signal' }, handleIncomingBroadcast) // Listen for 'signal' event
+            .subscribe(async (status: REALTIME_SUBSCRIBE_STATES, err?: Error) => {
+                 if (status === 'SUBSCRIBED') {
+                      console.log(`Realtime: Subscribed to main channel for room ${roomId}`);
+                      try {
+                           await mainChannel.current?.track({ is_typing: false, user_id: userId } as PresencePayload);
+                      } catch (trackError: any) {
+                          console.error("Realtime: Error tracking initial presence:", trackError);
+                          onSubscriptionError("Could not set up presence", trackError);
+                      }
+                 } else if (err) {
+                      console.error(`Realtime: Main channel subscription error for ${roomId}:`, err);
+                      onSubscriptionError("Could not connect to chat room", err);
+                 }
+            });
 
-        // Return the cleanup function for this effect
         return () => {
             console.log(`Realtime: Cleanup effect running for roomId ${roomId}`);
             cleanupSubscriptions();
         };
-    // Rerun when roomId or supabase client changes
-    }, [roomId, userId, supabase, cleanupSubscriptions, onNewMessage, onSystemMessage, onPartnerJoined, onPartnerLeft, onSubscriptionError]); // Added isPartnerTyping state itself to deps? No, internal state.
+    }, [roomId, userId, supabase, cleanupSubscriptions, onNewMessage, onPartnerJoined, onPartnerLeft, onSignalingMessage, onSubscriptionError]);
 
 
-     // Function to be called by the main hook to update presence
      const sendTypingPresence = useCallback((isTypingUpdate: boolean) => {
-        if (!presenceChannel.current || presenceChannel.current.state !== 'joined') return;
+        if (!mainChannel.current || mainChannel.current.state !== 'joined') return;
 
-        // Clear existing timeout if user continues typing
         if (typingTimeoutRef.current) {
             clearTimeout(typingTimeoutRef.current);
             typingTimeoutRef.current = null;
@@ -269,19 +216,35 @@ export function useChatRealtime({
         const payload: PresencePayload = { is_typing: isTypingUpdate, user_id: userId };
 
         if (isTypingUpdate) {
-             // console.log('Tracking typing: true');
-             presenceChannel.current.track(payload).catch(err => console.error("Presence track error (true):", err));
+             mainChannel.current.track(payload).catch(err => console.error("Presence track error (true):", err));
         } else {
-             // Debounce sending typing=false
              typingTimeoutRef.current = setTimeout(() => {
-                 // console.log('Tracking typing: false (debounced)');
-                 presenceChannel.current?.track(payload).catch(err => console.error("Presence track error (false):", err));
+                 mainChannel.current?.track(payload).catch(err => console.error("Presence track error (false):", err));
                  typingTimeoutRef.current = null;
-             }, 1500); // Send 'stopped typing' after 1.5 seconds of inactivity
+             }, 1500);
         }
-    }, [userId]); // roomId is implicitly handled by the channel ref lifecycle
+    }, [userId]);
 
-    // Cleanup timeout on unmount
+     const sendSignalingMessage = useCallback(async (payload: SignalingMessage) => {
+        if (!mainChannel.current || mainChannel.current.state !== 'joined') {
+            console.error("Cannot send signal: Realtime channel not ready.");
+            return;
+        }
+        try {
+             console.log(`Realtime: Broadcasting signal event '${payload.type}'`);
+             const status = await mainChannel.current.send({
+                 type: 'broadcast',
+                 event: 'signal', // Use a specific event name like 'signal'
+                 payload: payload,
+             });
+             console.log("Realtime: Broadcast status:", status);
+        } catch (error) {
+             console.error("Realtime: Error broadcasting signal:", error);
+             onSubscriptionError("Failed to send video signal", error as Error);
+        }
+    }, []);
+
+
      useEffect(() => {
          return () => {
              if (typingTimeoutRef.current) {
@@ -294,5 +257,6 @@ export function useChatRealtime({
     return {
         isPartnerTyping,
         sendTypingPresence,
+        sendSignalingMessage,
     };
 }
