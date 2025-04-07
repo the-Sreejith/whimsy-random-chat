@@ -4,7 +4,7 @@ import { useState, useEffect, useCallback, useMemo } from "react";
 import { v4 as uuidv4 } from "uuid";
 import { toast } from "sonner";
 import { Message, ChatStatus, SignalingMessage } from "@/types/chat";
-import { getSupabaseBrowserClient } from "@/lib/supabase/client";
+import { getSupabaseBrowserClient, getUserId } from "@/lib/supabase/client";
 import { useChatRealtime } from "./useChatRealtime";
 import * as ChatApi from "./useChatApi";
 
@@ -16,14 +16,19 @@ export function useChat() {
     const [partnerId, setPartnerId] = useState<string | null>(null);
 
     useEffect(() => {
-        if (typeof window !== 'undefined') {
-            let id = localStorage.getItem('whimsyUserId');
-            if (!id) {
-                id = uuidv4();
-                localStorage.setItem('whimsyUserId', id);
+        const initUser = async () => {
+            try {
+                const id = await getUserId();
+                setUserId(id);
+            } catch (error) {
+                console.error("Error initializing user:", error);
+                toast.error("Failed to initialize user", { 
+                    description: "Please refresh the page to try again." 
+                });
             }
-            setUserId(id);
-        }
+        };
+        
+        initUser();
     }, []);
 
     const supabase = useMemo(() => getSupabaseBrowserClient(), []);
