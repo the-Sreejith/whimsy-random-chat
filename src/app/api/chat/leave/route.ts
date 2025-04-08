@@ -1,72 +1,118 @@
 import { NextResponse } from 'next/server';
-import { createSupabaseServerClient } from '@/lib/supabase/server';
-import type { SupabaseClient } from '@supabase/supabase-js';
-import type { Database } from '@/types/supabase';
 
-// --- Reused Helper: Remove User ---
-async function removeUserFromRoom(supabase: SupabaseClient<Database>, roomId: string, userId: string) {
-    console.log(`API [/leave -> removeUser]: Removing participant ${userId} from room ${roomId}...`);
-
-    // Delete participant first
-    const { error: deleteError } = await supabase
-        .from('chat_participants')
-        .delete()
-        .eq('user_id', userId)
-        .eq('room_id', roomId);
-
-     if (deleteError) {
-        console.error(`API [/leave -> removeUser]: Error removing participant ${userId} from room ${roomId}:`, deleteError);
-         // Don't throw, let cleanup proceed if possible
-     } else {
-        console.log(`API [/leave -> removeUser]: Participant ${userId} deleted from room ${roomId}.`);
-     }
-
-    // Optional: Check if room is empty and clean up
-    const { data: remaining, error: countError } = await supabase
-        .from('chat_participants')
-        .select('id', { count: 'exact', head: true })
-        .eq('room_id', roomId);
-
-    if (!countError && remaining?.length === 0) {
-         console.log(`API [/leave -> removeUser]: Room ${roomId} is empty. Deleting room.`);
-         await supabase.from('chat_messages').delete().eq('room_id', roomId);
-         await supabase.from('chat_rooms').delete().eq('id', roomId);
-         console.log(`API [/leave -> removeUser]: Empty room ${roomId} cleanup attempted.`);
-    } else if (countError) {
-         console.error(`API [/leave -> removeUser]: Error counting remaining participants in room ${roomId}:`, countError);
-    }
-
-    // Return true if delete didn't error, false otherwise (for potential different status code)
-    return !deleteError;
+// Import the rooms from start route (in a real app, this would be a shared module)
+// For simplicity, redeclaring here
+interface Room {
+  id: string;
+  participants: string[];
+  createdAt: number;
 }
-// --- End Helper ---
 
+// These would be imported from a shared module in a real application
+declare const waitingRooms: Room[];
+declare const activeRooms: Room[];
+declare const messages: Record<string, any[]>;
+
+// Remove user from room
+async function removeUserFromRoom(roomId: string, userId: string): Promise<boolean> {
+  console.log(`API [/leave]: Removing participant ${userId} from room ${roomId}...`);
+  
+  // Check waiting rooms
+  const waitingRoomIndex = waitingRooms.findIndex(room => room.id === roomId);
+  if (waitingRoomIndex !== -1) {
+    const room = waitingRooms[waitingRoomIndex];
+    const userIndex = room.participants.indexOf(userId);
+    
+    if (userIndex !== -1) {
+      room.participants.splice(userIndex, 1);
+      
+      // If room is empty, remove it
+      if (room.participants.length === 0) {
+        waitingRooms.splice(waitingRoomIndex, 1);
+        // Clean up messages
+        if (messages[roomId]) {
+          delete messages[roomId];
+        }
+      }
+      
+      return true;
+    }
+  }
+  
+  // Check active rooms
+  const activeRoomIndex = activeRooms.findIndex(room => room.id === roomId);
+  if (activeRoomIndex !== -1) {
+    const room = activeRooms[activeRoomIndex];
+    const userIndex = room.participants.indexOf(userId);
+    
+    if (userIndex !== -1) {
+      room.participants.splice(userIndex, 1);
+      
+      // If room has only one participant, move it to waiting rooms
+      if (room.participants.length === 1) {
+        activeRooms.splice(activeRoomIndex, 1);
+        waitingRooms.push(room);
+        
+        // Add system message (in a real implementation, this would notify the other user)
+        if (messages[roomId]) {
+          messages[roomId].push({
+            id: Math.random().toString(36).substring(2, 15),
+            roomId,
+            senderId: 'system',
+            text: 'Your partner has left the chat. Waiting for a new partner...',
+            isSystem: true,
+            timestamp: Date.now()
+          });
+        }
+      } else if (room.participants.length === 0) {
+        // If room is empty, remove it
+        activeRooms.splice(activeRoomIndex, 1);
+        // Clean up messages
+        if (messages[roomId]) {
+          delete messages[roomId];
+        }
+      }
+      
+      return true;
+    }
+  }
+  
+  // User not found in room
+  return false;
+}
 
 export async function POST(request: Request) {
-    try {
-        const body = await request.json();
-        const { roomId, userId } = body;
+  try {
+    const body = await request.json();
+    const { roomId, userId } = body;
 
-        if (!roomId || !userId) {
-            return NextResponse.json({ message: 'Room ID and User ID are required.' }, { status: 400 });
-        }
-
-        const supabase = createSupabaseServerClient();
-        const success = await removeUserFromRoom(supabase, roomId, userId);
-
-        // Realtime handles notifying partner via participant change subscription
-        if (success) {
-            return NextResponse.json({ success: true, message: 'Successfully left the chat.' }, { status: 200 });
-        } else {
-             // Even if delete failed (e.g., user already gone), client likely considers it success
-             return NextResponse.json({ success: true, message: 'Leave request processed (user might have already left).' }, { status: 200 });
-        }
-
-    } catch (error: any) {
-        console.error("API Error [/api/chat/leave]:", error);
-        if (error instanceof SyntaxError) {
-             return NextResponse.json({ message: 'Invalid JSON payload.' }, { status: 400 });
-         }
-        return NextResponse.json({ success: false, message: error.message || 'Server error leaving chat.' }, { status: 500 });
+    if (!roomId || !userId) {
+      return NextResponse.json({ message: 'Room ID and User ID are required.' }, { status: 400 });
     }
+
+    const success = await removeUserFromRoom(roomId, userId);
+    
+    if (success) {
+      return NextResponse.json({ 
+        success: true, 
+        message: 'Successfully left the chat.' 
+      }, { status: 200 });
+    } else {
+      // Even if not found, client may consider it success
+      return NextResponse.json({ 
+        success: true, 
+        message: 'Leave request processed (user might have already left).' 
+      }, { status: 200 });
+    }
+
+  } catch (error: any) {
+    console.error("API Error [/api/chat/leave]:", error);
+    if (error instanceof SyntaxError) {
+      return NextResponse.json({ message: 'Invalid JSON payload.' }, { status: 400 });
+    }
+    return NextResponse.json({ 
+      success: false, 
+      message: error.message || 'Server error leaving chat.' 
+    }, { status: 500 });
+  }
 }

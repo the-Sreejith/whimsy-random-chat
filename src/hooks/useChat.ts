@@ -4,7 +4,6 @@ import { useState, useEffect, useCallback, useMemo } from "react";
 import { v4 as uuidv4 } from "uuid";
 import { toast } from "sonner";
 import { Message, ChatStatus, SignalingMessage } from "@/types/chat";
-import { getSupabaseBrowserClient, getUserId } from "@/lib/supabase/client";
 import { useChatRealtime } from "./useChatRealtime";
 import * as ChatApi from "./useChatApi";
 
@@ -18,7 +17,7 @@ export function useChat() {
     useEffect(() => {
         const initUser = async () => {
             try {
-                const id = await getUserId();
+                const id = ""
                 setUserId(id);
             } catch (error) {
                 console.error("Error initializing user:", error);
@@ -31,7 +30,6 @@ export function useChat() {
         initUser();
     }, []);
 
-    const supabase = useMemo(() => getSupabaseBrowserClient(), []);
 
     const addMessage = useCallback((text: string, sender: "me" | "stranger" | "system", msgId?: string, timestamp?: number) => {
         const newMessage: Message = {
@@ -95,7 +93,7 @@ export function useChat() {
      }, []);
 
     const { isPartnerTyping, sendTypingPresence, sendSignalingMessage: sendSignalViaRealtime } = useChatRealtime({
-        supabase,
+
         roomId,
         userId,
         onNewMessage: handleNewMessage,
