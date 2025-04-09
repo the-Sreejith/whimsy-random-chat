@@ -1,0 +1,107 @@
+<!-- public/index.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Whimsy Chat</title>
+  <style>
+    video { width: 45%; margin: 10px; border: 2px solid #ccc; }
+    #status { margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <h1>Whimsy WebRTC Chat</h1>
+  <video id="localVideo" autoplay muted playsinline></video>
+  <video id="remoteVideo" autoplay playsinline></video>
+  <div id="status">Connecting...</div>
+
+  <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+  <script>
+    const socket = io('http://localhost:3001'); // update if deployed elsewhere
+
+    let localStream;
+    let remoteStream;
+    let peerConnection;
+    const config = {
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' } // STUN server
+      ]
+    };
+
+    const localVideo = document.getElementById('localVideo');
+    const remoteVideo = document.getElementById('remoteVideo');
+    const status = document.getElementById('status');
+
+    socket.on('connect', async () => {
+      console.log('Connected to signaling server:', socket.id);
+    });
+
+    socket.on('your-id', id => {
+      console.log('My ID is', id);
+    });
+
+    socket.on('waiting', () => {
+      status.innerText = 'Waiting for a partner...';
+    });
+
+    socket.on('matched', async ({ partnerId }) => {
+      status.innerText = `Matched with ${partnerId}`;
+      await setupWebRTC(true);
+    });
+
+    socket.on('partner-disconnected', () => {
+      status.innerText = 'Partner disconnected.';
+      if (remoteVideo.srcObject) remoteVideo.srcObject.getTracks().forEach(t => t.stop());
+      remoteVideo.srcObject = null;
+    });
+
+    socket.on('signal', async (data) => {
+      if (!peerConnection) await setupWebRTC(false);
+
+      if (data.type === 'offer') {
+        await peerConnection.setRemoteDescription(new RTCSessionDescription(data));
+        const answer = await peerConnection.createAnswer();
+        await peerConnection.setLocalDescription(answer);
+        socket.emit('signal', answer);
+      } else if (data.type === 'answer') {
+        await peerConnection.setRemoteDescription(new RTCSessionDescription(data));
+      } else if (data.candidate) {
+        try {
+          await peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate));
+        } catch (e) {
+          console.error('Error adding ICE candidate', e);
+        }
+      }
+    });
+
+    async function setupWebRTC(isInitiator) {
+      peerConnection = new RTCPeerConnection(config);
+
+      // Local video
+      localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      localStream.getTracks().forEach(track => peerConnection.addTrack(track, localStream));
+      localVideo.srcObject = localStream;
+
+      // Remote stream
+      remoteStream = new MediaStream();
+      remoteVideo.srcObject = remoteStream;
+
+      peerConnection.ontrack = (event) => {
+        event.streams[0].getTracks().forEach(track => remoteStream.addTrack(track));
+      };
+
+      peerConnection.onicecandidate = (event) => {
+        if (event.candidate) {
+          socket.emit('signal', { candidate: event.candidate });
+        }
+      };
+
+      if (isInitiator) {
+        const offer = await peerConnection.createOffer();
+        await peerConnection.setLocalDescription(offer);
+        socket.emit('signal', offer);
+      }
+    }
+  </script>
+</body>
+</html>
