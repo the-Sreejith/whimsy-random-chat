@@ -1,4 +1,5 @@
-'use client';
+'use client'; //chatInterface.tsx
+
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { v4 as uuidv4 } from 'uuid';
@@ -7,14 +8,13 @@ import { Input } from '@/components/ui/input';
 import { Send, RefreshCw, X, Search, Loader2, Video, VideoOff, PhoneOff } from 'lucide-react';
 import { toast } from 'sonner';
 
-import ChatMessage from '@/components/ChatMessage'; // Keep this
-import TypingIndicator from '@/components/TypingIndicator'; // Keep this
-import VideoPlayer from '@/components/VideoPlayer'; // Keep this
-import { useWebRTC } from '@/hooks/useWebRTC'; // Keep this
-import { useChatManager, ChatStatus } from '@/hooks/useChatManager'; // Import the new hook
-import { Message, SignalingMessage } from '@/types/chat'; // Keep this
+import ChatMessage from '@/components/ChatMessage'; 
+import TypingIndicator from '@/components/TypingIndicator'; 
+import VideoPlayer from '@/components/VideoPlayer'; 
+import { useWebRTC } from '@/hooks/useWebRTC'; 
+import { useChatManager } from '@/hooks/useChatManager';
+import { Message, ChatStatus } from '@/types/chat'; 
 
-const SOCKET_SERVER_URL = process.env.NEXT_PUBLIC_SOCKET_URL || "http://localhost:3001";
 
 // --- Child Component Props (Optional but good practice) ---
 interface ChatHeaderProps {
@@ -89,7 +89,6 @@ export default function ChatInterface() {
         sendTyping: sendSocketTyping,
         sendSignal: sendSocketSignal,
     } = useChatManager({
-        socketUrl: SOCKET_SERVER_URL,
         onMessageReceived: useCallback((message) => {
             setMessages(prev => [...prev, message]);
             // Focus input when message received? Optional.

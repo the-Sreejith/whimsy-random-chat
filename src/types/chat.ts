@@ -6,7 +6,7 @@ export interface Message {
   system?: boolean;
 }
 
-export type ChatStatus = "idle" | "searching" | "chatting" | "disconnected";
+export type ChatStatus = "idle" | "connecting" | "waiting" | "chatting" | "disconnected" | "error";
 
 export interface SignalingMessage {
   type: 'video-offer' | 'video-answer' | 'ice-candidate' | 'bye';
