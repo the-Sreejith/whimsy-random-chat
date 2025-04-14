@@ -1,65 +1,79 @@
 // hooks/useWebRTC.ts
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { SignalingMessage } from '@/types/chat';
-import { toast } from 'sonner'; // Added for potential error display
+import { SignalingMessage } from '@/types/chat'; // Assuming you have this type defined
+import { toast } from 'sonner';
 
 // WebRTC configuration
 const ICE_SERVERS = [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
-    // Add TURN servers in production for reliable NAT traversal
+    // Add TURN servers here for production
 ];
 
 interface WebRTCHookProps {
     userId: string | null;
     partnerId: string | null;
-    sendSignal: (signal: Omit<SignalingMessage, 'sender' | 'target'>) => void;
-    onStreamError?: (error: Error) => void;
-    onCallEnded?: () => void; // Callback when call ends locally or due to connection failure
+    sendSignal: (signal: Omit<SignalingMessage, 'sender' | 'target'>) => void; // Function to send signal via Socket
+    onStreamError?: (error: Error) => void; // Callback for media stream errors
+    onCallEnded?: () => void; // Callback when the call ends (locally or remotely signaled)
 }
 
 interface WebRTCHookReturn {
     localStream: MediaStream | null;
     remoteStream: MediaStream | null;
-    isWebRTCActive: boolean;
-    startVideoCall: () => Promise<void>;
-    stopVideoCall: (notify?: boolean) => void; // Added notify flag
-    receivedSignal: (message: SignalingMessage) => void;
+    isWebRTCActive: boolean; // Is a WebRTC connection process active/established?
+    startVideoCall: () => Promise<void>; // Function to initiate the call
+    stopVideoCall: (notifyPartner?: boolean) => void; // Function to stop the call
+    receivedSignal: (message: SignalingMessage) => void; // Function to process incoming signals
 }
 
 export function useWebRTC({
     userId,
     partnerId,
     sendSignal,
-    onStreamError = () => { },
-    onCallEnded = () => { }
+    onStreamError = () => {},
+    onCallEnded = () => {}
 }: WebRTCHookProps): WebRTCHookReturn {
     const [localStream, setLocalStream] = useState<MediaStream | null>(null);
     const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
-    const [isWebRTCActive, setIsWebRTCActive] = useState(false);
+    const [isWebRTCActive, setIsWebRTCActive] = useState(false); // Tracks if call setup is in progress or active
 
     const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
+    // Ref to track if *this* client initiated the current connection attempt.
+    // Useful for debugging or handling glare, but not strictly necessary for basic flow.
     const isInitiatorRef = useRef(false);
     const pendingCandidatesRef = useRef<RTCIceCandidate[]>([]);
 
-    // Stable reference for sendSignal
+    // Use refs for callbacks passed as props to ensure stability inside other useCallback hooks
     const sendSignalRef = useRef(sendSignal);
+    const onStreamErrorRef = useRef(onStreamError);
+    const onCallEndedRef = useRef(onCallEnded);
+
     useEffect(() => {
         sendSignalRef.current = sendSignal;
-    }, [sendSignal]);
+        onStreamErrorRef.current = onStreamError;
+        onCallEndedRef.current = onCallEnded;
+    }, [sendSignal, onStreamError, onCallEnded]);
 
-    // Function to cleanup WebRTC resources
+    // --- Cleanup Function ---
+    // Now depends only on the stable onCallEndedRef
     const cleanupWebRTC = useCallback((notifyEnd = true) => {
-        console.log('[WebRTC] Cleaning up WebRTC resources.');
+        console.log('[WebRTC] Cleaning up WebRTC resources.', { notifyEnd });
 
+        // Stop local media tracks
         if (localStream) {
+            console.log('[WebRTC] Stopping local stream tracks.');
             localStream.getTracks().forEach(track => track.stop());
-            setLocalStream(null);
+            setLocalStream(null); // Clear state
         }
+
+        // Clear remote stream state
         setRemoteStream(null);
 
+        // Close PeerConnection
         if (peerConnectionRef.current) {
-            // Remove listeners before closing
+            console.log('[WebRTC] Closing Peer Connection.');
+            // Remove listeners to prevent errors after closing
             peerConnectionRef.current.onicecandidate = null;
             peerConnectionRef.current.onconnectionstatechange = null;
             peerConnectionRef.current.ontrack = null;
@@ -68,276 +82,357 @@ export function useWebRTC({
             peerConnectionRef.current = null;
         }
 
-        setIsWebRTCActive(false);
-        isInitiatorRef.current = false;
-        pendingCandidatesRef.current = [];
+        // Reset state flags
+        setIsWebRTCActive(false); // Mark connection as inactive
+        isInitiatorRef.current = false; // Reset initiator status
+        pendingCandidatesRef.current = []; // Clear any pending candidates
 
+        // Notify parent component if requested
         if (notifyEnd) {
-            onCallEnded(); // Notify parent component
+            console.log('[WebRTC] Notifying parent component call ended.');
+            onCallEndedRef.current();
         }
-    }, [localStream, onCallEnded]); // Added onCallEnded dependency
+    }, [localStream]); // Now correctly depends on localStream to stop its tracks
 
-    // Stop video call function
-    const stopVideoCall = useCallback((notify = true) => {
-        console.log('[WebRTC] stopVideoCall invoked.');
-        cleanupWebRTC(notify);
-        // Optionally send a signal to the partner that the call ended?
-        // sendSignalRef.current({ type: 'call-ended' });
-    }, [cleanupWebRTC]);
+    // --- Stop Video Call ---
+    const stopVideoCall = useCallback((notifyPartner = true) => {
+        console.log('[WebRTC] stopVideoCall invoked.', { notifyPartner });
+        // Optionally send a 'bye' signal 
+        if (notifyPartner && peerConnectionRef.current && partnerId && userId) {
+            console.log('[WebRTC] Sending call-ended signal.');
+            sendSignalRef.current({ type: 'bye', payload: null });
+        }
+        cleanupWebRTC(true); // Always notify parent locally when stop is called
+    }, [cleanupWebRTC]); // Depends on the stable cleanupWebRTC
 
+    // --- Get Local Media Stream ---
+    const getLocalMedia = useCallback(async (): Promise<MediaStream | null> => {
+        try {
+            console.log("[WebRTC] Requesting user media (video, audio)...");
+            const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+            console.log("[WebRTC] User media acquired.");
+            setLocalStream(stream); // Update state
+            // Don't set active here anymore, moved to startVideoCall
+            return stream;
+        } catch (err: any) {
+            console.error("[WebRTC] Error getting user media:", err);
+            onStreamErrorRef.current(err); // Notify parent
+            cleanupWebRTC(false); // Cleanup without double notification
+            return null; // Indicate failure
+        }
+    }, [cleanupWebRTC]); // Depends on cleanupWebRTC for error handling
 
-    // Helper to create a new RTCPeerConnection
-    const createPeerConnection = useCallback(() => {
-        // Cleanup existing connection first
+    // --- Create Peer Connection ---
+    const createPeerConnection = useCallback(async (stream: MediaStream): Promise<RTCPeerConnection | null> => {
+        // Cleanup existing connection *before* creating a new one
         if (peerConnectionRef.current) {
             console.warn("[WebRTC] Existing peer connection found during creation. Cleaning up first.");
             cleanupWebRTC(false); // Don't notify end on implicit cleanup
         }
 
-        console.log("[WebRTC] Creating new Peer Connection");
-        const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-        peerConnectionRef.current = pc;
-
-        pc.onicecandidate = (event) => {
-            if (event.candidate && partnerId && userId) { // Check partnerId/userId again
-                console.log("[WebRTC] Sending ICE candidate");
-                sendSignalRef.current({
-                    type: 'ice-candidate',
-                    candidate: event.candidate,
-                });
-            }
-        };
-
-        pc.onconnectionstatechange = () => {
-            const state = pc.connectionState;
-            console.log("[WebRTC] Connection state changed:", state);
-            if (state === 'failed' || state === 'disconnected' || state === 'closed') {
-                console.warn(`[WebRTC] Peer connection state is ${state}. Cleaning up.`);
-                // Don't call stopVideoCall directly to avoid loops if called from stopVideoCall
-                cleanupWebRTC(true); // Notify parent on failure/disconnect
-            }
-        };
-
-        pc.ontrack = (event) => {
-            console.log("[WebRTC] Track received:", event.track.kind);
-            if (event.streams && event.streams[0]) {
-                console.log("[WebRTC] Setting remote stream");
-                setRemoteStream(event.streams[0]);
-            } else {
-                 // Sometimes streams[0] isn't available, try adding track to a new stream
-                 if (!remoteStream) {
-                    const newStream = new MediaStream();
-                    newStream.addTrack(event.track);
-                    setRemoteStream(newStream);
-                    console.log("[WebRTC] Created new remote stream for track");
-                 } else {
-                    remoteStream.addTrack(event.track);
-                    console.log("[WebRTC] Added track to existing remote stream");
+        try {
+            console.log("[WebRTC] Creating new Peer Connection with ICE servers:", ICE_SERVERS);
+            const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+            peerConnectionRef.current = pc;
+    
+            // Add local tracks
+            stream.getTracks().forEach(track => {
+                try {
+                    pc.addTrack(track, stream);
+                    console.log(`[WebRTC] Track added: ${track.kind}`);
+                } catch (error) {
+                     console.error(`[WebRTC] Error adding track ${track.kind}:`, error);
+                }
+            });
+    
+            // --- Event Handlers for the Peer Connection ---
+    
+            // Handle ICE Candidates
+            pc.onicecandidate = (event) => {
+                if (event.candidate && partnerId && userId) {
+                    console.log("[WebRTC] Sending ICE candidate:", event.candidate.type, event.candidate.sdpMLineIndex);
+                    sendSignalRef.current({
+                        type: 'ice-candidate',
+                        payload: event.candidate
+                    });
+                } else if (!event.candidate) {
+                     console.log("[WebRTC] All local ICE candidates sent.");
+                }
+            };
+    
+            // Handle Connection State Changes
+            pc.onconnectionstatechange = () => {
+                const state = pc.connectionState;
+                console.log("[WebRTC] Connection state changed:", state);
+                switch (state) {
+                    case 'connected':
+                        console.log("[WebRTC] Peers connected!");
+                        // Connection established
+                        setIsWebRTCActive(true); // Ensure it's marked active
+                        break;
+                    case 'disconnected':
+                        console.warn("[WebRTC] Peers disconnected. Attempting to reconnect?");
+                        // Connection lost, may recover
+                        break;
+                    case 'failed':
+                        console.error("[WebRTC] Peer connection failed.");
+                        // Connection failed irrecoverably
+                        stopVideoCall(false); // Cleanup and notify parent (don't notify partner)
+                        break;
+                    case 'closed':
+                        console.log("[WebRTC] Peer connection closed.");
+                        // Connection closed, likely via cleanupWebRTC
+                        break;
+                }
+            };
+    
+            // Handle Incoming Tracks
+            pc.ontrack = (event) => {
+                console.log("[WebRTC] Track received:", event.track.kind, "Stream IDs:", event.streams.map(s => s.id));
+                if (event.streams && event.streams[0]) {
+                    console.log("[WebRTC] Setting remote stream from event.streams[0]");
+                    setRemoteStream(event.streams[0]);
+                } else {
+                     // Fallback: create a new stream if needed
+                     console.warn("[WebRTC] event.streams[0] not available. Creating new stream for track.");
+                     const newStream = new MediaStream();
+                     newStream.addTrack(event.track);
+                     setRemoteStream(newStream);
+                }
+                setIsWebRTCActive(true); // Ensure active state is set when tracks arrive
+            };
+    
+             // Handle ICE Connection State (more granular than connectionstatechange)
+             pc.oniceconnectionstatechange = () => {
+                 console.log("[WebRTC] ICE Connection State:", pc.iceConnectionState);
+                 if (pc.iceConnectionState === 'failed') {
+                      console.error("[WebRTC] ICE connection failed. Consider ICE restart.");
+                      // Optional: Implement ICE restart logic here if needed
+                      // pc.restartIce();
                  }
-            }
-        };
-
-        pc.oniceconnectionstatechange = () => {
-            console.log("[WebRTC] ICE Connection State:", pc.iceConnectionState);
-            if (pc.iceConnectionState === 'failed') {
-                 console.error("[WebRTC] ICE connection failed. Restarting ICE?");
-                 // pc.restartIce(); // Consider ICE restart strategy if needed
-            }
-        };
-
-        return pc;
-    }, [userId, partnerId, cleanupWebRTC]); // Added dependencies
-
-
-    // Handle received signaling messages
-    const receivedSignal = useCallback(async (message: SignalingMessage) => {
-        if (message.sender === userId || !partnerId) {
-             // console.log("[WebRTC] Ignoring signal from self or when no partner.");
-             return;
+             };
+    
+            return pc;
+        } catch (error) {
+            console.error("[WebRTC] Error creating peer connection:", error);
+            return null;
         }
+    }, [userId, partnerId, cleanupWebRTC, stopVideoCall]); // Dependencies
 
-        console.log("[WebRTC] Received signal:", message.type, "from:", message.sender);
+    // Flag to prevent multiple simultaneous call starts
+    const isStartingCallRef = useRef(false);
 
-        // Ensure peer connection exists, create if not (e.g., receiving offer before starting call)
-        const pc = peerConnectionRef.current ?? createPeerConnection();
-        if (!pc) {
-            console.error("[WebRTC] Failed to get/create peer connection for signal:", message.type);
+    // --- Start Video Call (Initiator) ---
+    const startVideoCall = useCallback(async () => {
+        if (isStartingCallRef.current) {
+            console.log("[WebRTC] Call start already in progress. Ignoring duplicate request.");
             return;
+        }
+        
+        if (!userId || !partnerId) {
+            console.error("[WebRTC] Cannot start call: Missing userId or partnerId.");
+            toast.error("Cannot Start Video", { description: "User or partner ID missing." });
+            return;
+        }
+        if (isWebRTCActive) {
+            console.warn("[WebRTC] startVideoCall called while already active or starting.");
+            return;
+        }
+        if (peerConnectionRef.current) {
+            console.warn("[WebRTC] startVideoCall called while a peer connection already exists. Potential state issue.");
+            // Optionally clean up first? Or just proceed? Let's proceed cautiously.
         }
 
         try {
+            // Set flag to prevent duplicate starts
+            isStartingCallRef.current = true;
+            
+            console.log("[WebRTC] === Initiating Video Call ===");
+            isInitiatorRef.current = true;
+            
+            // Set active state BEFORE starting the async process
+            // This helps prevent unmounts during the async operations
+            setIsWebRTCActive(true);
+    
+            const stream = await getLocalMedia();
+            if (!stream) {
+                setIsWebRTCActive(false); // Reset if media acquisition failed
+                return; // Error handled in getLocalMedia
+            }
+    
+            const pc = await createPeerConnection(stream);
+            if (!pc) {
+                setIsWebRTCActive(false); // Reset if peer connection creation failed
+                return; // Error creating PC
+            }
+    
+            console.log("[WebRTC] Creating offer...");
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            console.log("[WebRTC] Local description (offer) set.");
+    
+            // Send the offer to the partner
+            sendSignalRef.current({ 
+                type: 'video-offer', 
+                payload: pc.localDescription 
+            });
+            console.log("[WebRTC] Offer sent.");
+        } catch (err: any) {
+            console.error("[WebRTC] Error creating/sending offer:", err);
+            onStreamErrorRef.current(err);
+            stopVideoCall(false); // Cleanup on failure
+        } finally {
+            // Reset flag when done (success or error)
+            isStartingCallRef.current = false;
+        }
+    }, [userId, partnerId, isWebRTCActive, getLocalMedia, createPeerConnection, stopVideoCall]); // Dependencies
+
+    // --- Handle Received Signaling Messages ---
+    const receivedSignal = useCallback(async (message: SignalingMessage) => {
+        // Ignore signals if not intended for us, or if basic IDs are missing
+        if (message.sender === userId || !partnerId || !userId) {
+             // console.log("[WebRTC] Ignoring signal from self or missing IDs.");
+             return;
+        }
+
+        console.log("[WebRTC] <<< Received Signal:", message.type, "from:", message.sender);
+
+        try {
+            // Get or create PeerConnection. Crucial for handling offer before local start.
+            let pc = peerConnectionRef.current;
+            let stream = localStream; // Use existing stream if available
+
+            // Ensure we have local media and PC when handling offer/answer
+            if ((message.type === 'video-offer' || message.type === 'video-answer') && !pc) {
+                 console.log("[WebRTC] PC not found for offer/answer, need to create.");
+                 if (!stream) {
+                     console.log("[WebRTC] Local stream needed for offer/answer handling.");
+                     stream = await getLocalMedia(); // Get media first
+                     if (!stream) throw new Error("Failed to get local media to handle signal.");
+                 }
+                 pc = await createPeerConnection(stream); // Create PC with the stream
+                 if (!pc) throw new Error("Failed to create peer connection to handle signal.");
+            } else if (!pc && message.type !== 'ice-candidate') {
+                 // If pc is still null here for non-candidate messages, something is wrong
+                 console.error("[WebRTC] PeerConnection is null while processing signal:", message.type);
+                 throw new Error(`PeerConnection not available for signal type ${message.type}`);
+            }
+
+
+            // Process different signal types
             switch (message.type) {
-                case 'offer':
-                    if (!message.offer) throw new Error("Offer signal missing offer data");
-                    console.log("[WebRTC] Processing offer...");
+                case 'video-offer':
+                    if (!message.payload) throw new Error("Offer signal missing payload data.");
+                    if (!pc) throw new Error("PeerConnection not ready for offer."); // Should be created above
 
-                    // Ensure we have a local stream *before* setting remote description and creating answer
-                    // This might involve calling getUserMedia if not already active
-                     let stream = localStream;
-                     if (!stream && isWebRTCActive) { // Check isWebRTCActive flag
-                         console.log("[WebRTC] Getting local stream for answering offer...");
-                         try {
-                             stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-                             setLocalStream(stream); // Set state if successful
-                             stream.getTracks().forEach(track => {
-                                 // Avoid adding tracks multiple times if connection already exists
-                                 if (!pc.getSenders().find(sender => sender.track === track)) {
-                                     pc.addTrack(track, stream!);
-                                 }
-                             });
-                         } catch (err: any) {
-                              console.error("[WebRTC] Error getting media for answer:", err);
-                              onStreamError(err);
-                              // Maybe send an error signal back?
-                              cleanupWebRTC(true); // Cleanup if we can't get media
-                              return;
-                         }
-                     } else if (stream) {
-                          // Ensure tracks are added if somehow missed
-                          stream.getTracks().forEach(track => {
-                                if (!pc.getSenders().find(sender => sender.track === track)) {
-                                    pc.addTrack(track, stream!);
-                                }
-                            });
-                     }
+                    console.log("[WebRTC] Processing received offer...");
+                    isInitiatorRef.current = false; // We are the receiver now
 
-
-                    await pc.setRemoteDescription(new RTCSessionDescription(message.offer));
+                    // Set remote description (the offer)
+                    await pc.setRemoteDescription(new RTCSessionDescription(message.payload));
                     console.log("[WebRTC] Remote description (offer) set.");
 
+                    // Create answer
                     console.log("[WebRTC] Creating answer...");
                     const answer = await pc.createAnswer();
                     await pc.setLocalDescription(answer);
                     console.log("[WebRTC] Local description (answer) set.");
 
-                    sendSignalRef.current({ type: 'answer', answer: pc.localDescription });
+                    // Send the answer back
+                    sendSignalRef.current({ 
+                        type: 'video-answer', 
+                        payload: pc.localDescription 
+                    });
                     console.log("[WebRTC] Answer sent.");
 
-                    // Process pending candidates after setting descriptions
-                    console.log(`[WebRTC] Processing ${pendingCandidatesRef.current.length} pending candidates...`);
-                    pendingCandidatesRef.current.forEach(candidate => {
-                        pc.addIceCandidate(candidate).catch(err =>
-                            console.error("[WebRTC] Error adding queued ICE candidate:", err)
-                        );
-                    });
-                    pendingCandidatesRef.current = [];
+                    // Mark as active now that negotiation is underway
+                    setIsWebRTCActive(true);
+
+                    // Process any queued candidates *after* setting descriptions
+                     if (pendingCandidatesRef.current.length > 0) {
+                        console.log(`[WebRTC] Processing ${pendingCandidatesRef.current.length} pending candidates...`);
+                        await Promise.all(pendingCandidatesRef.current.map(candidate => pc!.addIceCandidate(candidate)));
+                        console.log("[WebRTC] Pending candidates processed.");
+                        pendingCandidatesRef.current = [];
+                    }
                     break;
 
-                case 'answer':
-                    if (!message.answer) throw new Error("Answer signal missing answer data");
-                    console.log("[WebRTC] Processing answer...");
+                case 'video-answer':
+                    if (!message.payload) throw new Error("Answer signal missing payload data.");
+                    if (!pc) throw new Error("PeerConnection not ready for answer.");
+
+                    console.log("[WebRTC] Processing received answer...");
                     if (pc.signalingState !== 'have-local-offer') {
-                         console.warn(`[WebRTC] Received answer in unexpected state: ${pc.signalingState}`);
-                         // Potentially ignore or handle error
-                         return;
+                         console.warn(`[WebRTC] Received answer in unexpected state: ${pc.signalingState}. Ignoring?`);
+                         // return; // Or handle as appropriate
                     }
-                    await pc.setRemoteDescription(new RTCSessionDescription(message.answer));
+
+                    // Set remote description (the answer)
+                    await pc.setRemoteDescription(new RTCSessionDescription(message.payload));
                     console.log("[WebRTC] Remote description (answer) set.");
 
-                    // Process pending candidates after setting descriptions
-                    console.log(`[WebRTC] Processing ${pendingCandidatesRef.current.length} pending candidates...`);
-                    pendingCandidatesRef.current.forEach(candidate => {
-                        pc.addIceCandidate(candidate).catch(err =>
-                            console.error("[WebRTC] Error adding queued ICE candidate:", err)
-                        );
-                    });
-                    pendingCandidatesRef.current = [];
+                    // Mark as active now that negotiation is complete from our side
+                    setIsWebRTCActive(true);
+
+                     // Process any queued candidates *after* setting descriptions
+                     if (pendingCandidatesRef.current.length > 0) {
+                         console.log(`[WebRTC] Processing ${pendingCandidatesRef.current.length} pending candidates...`);
+                         await Promise.all(pendingCandidatesRef.current.map(candidate => pc!.addIceCandidate(candidate)));
+                         console.log("[WebRTC] Pending candidates processed.");
+                         pendingCandidatesRef.current = [];
+                     }
                     break;
 
                 case 'ice-candidate':
-                    if (!message.candidate) throw new Error("ICE signal missing candidate data");
-                    console.log("[WebRTC] Processing ICE candidate...");
-                    const candidate = new RTCIceCandidate(message.candidate);
-
+                    if (!message.payload) throw new Error("ICE signal missing payload data.");
+                    if (!pc) {
+                        console.warn("[WebRTC] Received ICE candidate before PeerConnection ready. Queuing.");
+                        pendingCandidatesRef.current.push(new RTCIceCandidate(message.payload));
+                        return; // Wait for PC creation
+                    }
                     if (!pc.remoteDescription) {
-                        console.log("[WebRTC] Remote description not set, queuing ICE candidate.");
-                        pendingCandidatesRef.current.push(candidate);
+                        console.log("[WebRTC] Remote description not set yet. Queuing ICE candidate.");
+                        pendingCandidatesRef.current.push(new RTCIceCandidate(message.payload));
                     } else {
-                        await pc.addIceCandidate(candidate);
+                        console.log("[WebRTC] Adding received ICE candidate.");
+                        await pc.addIceCandidate(new RTCIceCandidate(message.payload));
                         console.log("[WebRTC] ICE candidate added.");
                     }
                     break;
 
-                // case 'call-ended': // Example if you implement this signal
-                //     console.log("[WebRTC] Received call-ended signal from partner.");
-                //     cleanupWebRTC(true); // Cleanup but notify parent it was partner initiated
-                //     break;
+                case 'bye':
+                    console.log("[WebRTC] Received 'bye' signal from partner.");
+                    toast.info("Partner ended the video call.");
+                    stopVideoCall(false); // Stop locally, don't notify partner back
+                    break;
 
                 default:
                     console.warn("[WebRTC] Unknown signal type received:", message.type);
             }
         } catch (error: any) {
             console.error("[WebRTC] Error processing signal:", message.type, error);
-            toast.error("WebRTC Error", { description: `Failed to process signal: ${error.message}` });
-            // Consider cleanup on critical signal processing errors
-            cleanupWebRTC(true);
+            toast.error("WebRTC Signaling Error", { description: `Failed to process signal (${message.type}): ${error.message}` });
+            // Consider a cleanup on critical errors
+            stopVideoCall(false); // Cleanup on error
         }
-    }, [userId, partnerId, createPeerConnection, localStream, onStreamError, isWebRTCActive, cleanupWebRTC]); // Added dependencies
+    }, [userId, partnerId, localStream, createPeerConnection, getLocalMedia, stopVideoCall]); // Key dependencies
 
 
-    // Start video call
-    const startVideoCall = useCallback(async () => {
-        if (!userId || !partnerId) {
-            console.error("[WebRTC] Cannot start call: Missing userId or partnerId.");
-            toast.error("WebRTC Error", { description: "Cannot start video call. User or partner ID missing." });
-            return;
-        }
-        if (isWebRTCActive) {
-            console.warn("[WebRTC] startVideoCall called while already active.");
-            return;
-        }
-
-        console.log("[WebRTC] Attempting to start video call...");
-        isInitiatorRef.current = true; // Assume initiator role
-        const pc = createPeerConnection(); // Create connection first
-
-        try {
-            console.log("[WebRTC] Requesting user media...");
-            const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-            console.log("[WebRTC] User media acquired.");
-            setLocalStream(stream);
-            setIsWebRTCActive(true); // Set active *after* getting stream
-
-            stream.getTracks().forEach(track => {
-                 // Check if track already added (might happen with quick restarts)
-                if (!pc.getSenders().find(sender => sender.track === track)) {
-                    pc.addTrack(track, stream);
-                    console.log(`[WebRTC] Track added: ${track.kind}`);
-                }
-            });
-
-
-            console.log("[WebRTC] Creating offer...");
-            const offer = await pc.createOffer();
-            await pc.setLocalDescription(offer);
-            console.log("[WebRTC] Local description (offer) set.");
-
-            sendSignalRef.current({ type: 'offer', offer: pc.localDescription });
-            console.log("[WebRTC] Offer sent.");
-
-        } catch (err: any) {
-            console.error("[WebRTC] Error starting video call:", err);
-            onStreamError(err);
-            toast.error("Video Error", { description: `Could not start video: ${err.message}` });
-            stopVideoCall(false); // Cleanup without notifying (already handled by error callback)
-        }
-    }, [userId, partnerId, isWebRTCActive, createPeerConnection, onStreamError, stopVideoCall]); // Added dependencies
-
-
-    // Effect for component unmount cleanup
+    // --- Effect for Component Unmount Cleanup ---
     useEffect(() => {
         return () => {
-            console.log("[WebRTC] Hook unmounting. Cleaning up...");
-            cleanupWebRTC(false); // Don't notify parent on unmount cleanup
+            console.log("[WebRTC] Hook unmounting. Cleaning up WebRTC.");
+            cleanupWebRTC(false); // Cleanup without notifying parent (unmount scenario)
         };
-    }, [cleanupWebRTC]); // Only depends on cleanupWebRTC
+    }, [cleanupWebRTC]); // Only depends on the stable cleanupWebRTC callback
 
+    // Return the state and functions needed by the parent component
     return {
         localStream,
         remoteStream,
         isWebRTCActive,
         startVideoCall,
         stopVideoCall,
-        receivedSignal,
+        receivedSignal, // Provide the handler for ChatManager to call
     };
 }

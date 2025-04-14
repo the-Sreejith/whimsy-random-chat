@@ -1,6 +1,5 @@
 'use client'; //chatInterface.tsx
 
-
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { v4 as uuidv4 } from 'uuid';
 import { Button } from '@/components/ui/button';
@@ -8,15 +7,15 @@ import { Input } from '@/components/ui/input';
 import { Send, RefreshCw, X, Search, Loader2, Video, VideoOff, PhoneOff } from 'lucide-react';
 import { toast } from 'sonner';
 
-import ChatMessage from '@/components/ChatMessage'; 
-import TypingIndicator from '@/components/TypingIndicator'; 
-import VideoPlayer from '@/components/VideoPlayer'; 
-import { useWebRTC } from '@/hooks/useWebRTC'; 
+import ChatMessage from '@/components/ChatMessage';
+import TypingIndicator from '@/components/TypingIndicator';
+import VideoPlayer from '@/components/VideoPlayer';
+import { WebRTCProvider, useWebRTCContext } from '@/components/WebRTCProvider';
 import { useChatManager } from '@/hooks/useChatManager';
-import { Message, ChatStatus } from '@/types/chat'; 
+import { Message, ChatStatus, SignalingMessage } from '@/types/chat';
 
 
-// --- Child Component Props (Optional but good practice) ---
+// --- Child Component Props ---
 interface ChatHeaderProps {
     status: ChatStatus;
     isWebRTCActive: boolean;
@@ -58,24 +57,58 @@ export default function ChatInterface() {
     const messagesEndRef = useRef<HTMLDivElement>(null);
     const inputRef = useRef<HTMLInputElement>(null);
 
-    // --- System Message Handling ---
+    // --- WebRTC Signal Handler Ref ---
+    const handleReceivedSignalRef = useRef<(payload: any) => void>(() => {});
+    
+    // --- Message Handling ---
     const addSystemMessage = useCallback((text: string) => {
         // Prevent duplicate consecutive system messages
-        if (messages.length > 0) {
+        if (text && messages.length > 0) {
             const lastMsg = messages[messages.length - 1];
             if (lastMsg.system && lastMsg.text === text) {
                  return;
             }
         }
+
+        if (text) { // Only add if there's text (skip empty triggers)
+            const newMessage: Message = {
+                id: uuidv4(),
+                text,
+                sender: "system",
+                timestamp: Date.now(),
+                system: true,
+            };
+            setMessages(prev => [...prev, newMessage]);
+        }
+    }, [messages]);
+
+    const addUserMessage = useCallback((text: string) => {
         const newMessage: Message = {
             id: uuidv4(),
             text,
-            sender: "system",
+            sender: "me",
             timestamp: Date.now(),
-            system: true,
         };
         setMessages(prev => [...prev, newMessage]);
-    }, [messages]); // Dependency on messages to check the last one
+    }, []);
+
+    const clearMessages = useCallback(() => {
+        setMessages([]);
+    }, []);
+
+    // --- WebRTC Hook Callbacks ---
+    const handleStreamError = useCallback((err: Error) => {
+        console.error("WebRTC Stream Error:", err);
+        toast.error("Video Error", {
+            description: err.message || "Could not start video stream."
+        });
+        addSystemMessage(`Video Error: ${err.message}`);
+    }, [addSystemMessage]);
+
+    const handleWebRTCCallEnded = useCallback(() => {
+        console.log("[ChatInterface] WebRTC call ended callback received.");
+        addSystemMessage("Video call ended.");
+    }, [addSystemMessage]);
 
     // --- Chat Manager Hook ---
     const {
@@ -91,16 +124,12 @@ export default function ChatInterface() {
     } = useChatManager({
         onMessageReceived: useCallback((message) => {
             setMessages(prev => [...prev, message]);
-            // Focus input when message received? Optional.
-            // inputRef.current?.focus();
         }, []),
         onSignalReceived: useCallback((payload) => {
-             // Forward signal to WebRTC hook
-             handleReceivedWebRTCSignal(payload);
-        }, []), // handleReceivedWebRTCSignal will be memoized by useWebRTC
+            handleReceivedSignalRef.current(payload);
+        }, []),
         onSystemMessage: useCallback((text) => {
             if (text === "A stranger has connected!") {
-                 // Clear "Looking for..." message more reliably
                  setMessages(prev => prev.filter(msg => !(msg.system && msg.text.includes("Looking for"))));
             }
             addSystemMessage(text);
@@ -110,124 +139,156 @@ export default function ChatInterface() {
         }, [addSystemMessage]),
     });
 
-    // --- WebRTC Hook ---
-    const handleStreamError = useCallback((err: Error) => {
-        console.error("WebRTC Stream Error:", err);
-        toast.error("Video Error", {
-            description: err.message || "Could not start video stream."
-        });
-        // Maybe add system message?
-        // addSystemMessage("Video connection failed.");
-    }, []);
+    // Main component with WebRTC provider
+    return (
+        <WebRTCProvider
+            userId={userId}
+            partnerId={partnerId}
+            sendSignal={sendSocketSignal}
+            onStreamError={handleStreamError}
+            onCallEnded={handleWebRTCCallEnded}
+        >
+            <ChatInterfaceContent
+                messages={messages}
+                inputValue={inputValue}
+                setInputValue={setInputValue}
+                messagesEndRef={messagesEndRef}
+                inputRef={inputRef}
+                status={status}
+                isPartnerTyping={isPartnerTyping}
+                partnerId={partnerId}
+                addSystemMessage={addSystemMessage}
+                addUserMessage={addUserMessage}
+                clearMessages={clearMessages}
+                connectSocket={connectSocket}
+                disconnectSocket={disconnectSocket}
+                sendSocketMessage={sendSocketMessage}
+                sendSocketTyping={sendSocketTyping}
+                handleReceivedSignalRef={handleReceivedSignalRef}
+            />
+        </WebRTCProvider>
+    );
+}
 
-    const handleWebRTCCallEnded = useCallback(() => {
-        console.log("[ChatInterface] WebRTC call ended callback received.");
-        // The useWebRTC hook manages its streams, just ensure UI reflects it.
-        // No need to add message here typically, unless explicitly desired.
-        // addSystemMessage("Video call ended.");
-    }, []);
+// Inner component that uses the WebRTC context
+interface ChatInterfaceContentProps {
+    messages: Message[];
+    inputValue: string;
+    setInputValue: React.Dispatch<React.SetStateAction<string>>;
+    messagesEndRef: React.RefObject<HTMLDivElement | null>;
+    inputRef: React.RefObject<HTMLInputElement | null>;
+    status: ChatStatus;
+    isPartnerTyping: boolean;
+    partnerId: string | null;
+    addSystemMessage: (text: string) => void;
+    addUserMessage: (text: string) => void;
+    clearMessages: () => void;
+    connectSocket: () => void;
+    disconnectSocket: (notifyServer?: boolean) => void;
+    sendSocketMessage: (text: string) => void;
+    sendSocketTyping: (isTyping: boolean) => void;
+    handleReceivedSignalRef: React.MutableRefObject<(payload: any) => void>;
+}
 
+function ChatInterfaceContent({
+    messages,
+    inputValue,
+    setInputValue,
+    messagesEndRef,
+    inputRef,
+    status,
+    isPartnerTyping,
+    partnerId,
+    addSystemMessage,
+    addUserMessage,
+    clearMessages,
+    connectSocket,
+    disconnectSocket,
+    sendSocketMessage,
+    sendSocketTyping,
+    handleReceivedSignalRef,
+}: ChatInterfaceContentProps) {
+    // Access WebRTC context
     const {
         localStream,
         remoteStream,
         isWebRTCActive,
         startVideoCall,
-        stopVideoCall: stopWebRTCCall,
+        stopVideoCall,
         receivedSignal: handleReceivedWebRTCSignal,
-    } = useWebRTC({
-        userId, // Passed from useChatManager
-        partnerId, // Passed from useChatManager
-        sendSignal: sendSocketSignal, // Pass the sendSignal function from useChatManager
-        onStreamError: handleStreamError,
-        onCallEnded: handleWebRTCCallEnded,
-    });
+    } = useWebRTCContext();
+
+    // Update signal handler ref when it changes
+    useEffect(() => {
+        handleReceivedSignalRef.current = handleReceivedWebRTCSignal;
+    }, [handleReceivedWebRTCSignal, handleReceivedSignalRef]);
 
     // --- Actions ---
     const handleStartChat = useCallback(() => {
-        setMessages([]); // Clear messages immediately for UI responsiveness
-        stopWebRTCCall(false); // Ensure WebRTC is stopped before connecting
+        clearMessages();
+        setInputValue("");
+        stopVideoCall(false);
         connectSocket();
-    }, [connectSocket, stopWebRTCCall]);
+    }, [connectSocket, stopVideoCall, setInputValue, clearMessages]);
 
     const handleEndChat = useCallback(() => {
-        stopWebRTCCall(true); // Stop WebRTC first, notify partner if possible
-        disconnectSocket(true); // Disconnect socket, notify server
-        // No need to add message here, useChatManager's 'disconnect' callback handles it
-    }, [disconnectSocket, stopWebRTCCall]);
+        stopVideoCall(true);
+        disconnectSocket(true);
+    }, [disconnectSocket, stopVideoCall]);
 
     const handleNextChat = useCallback(() => {
-        // Stop video first *before* disconnecting socket
-        stopWebRTCCall(true);
-
-        // Disconnect socket (notify server via 'leave' if chatting)
+        stopVideoCall(true);
         disconnectSocket(true);
-
-        // Reset local state and start connection again
-        // Use a short timeout to allow state updates to settle if needed,
-        // although useChatManager handles its internal state reset.
-        setMessages([]); // Clear messages immediately
-        // Optionally add a system message here if useChatManager doesn't cover it
+        clearMessages();
+        setInputValue("");
         addSystemMessage("Finding a new chat partner...");
         setTimeout(() => {
             connectSocket();
-        }, 100); // Small delay might help if state updates are complex
-
-    }, [disconnectSocket, stopWebRTCCall, connectSocket, addSystemMessage]);
+        }, 100);
+    }, [disconnectSocket, stopVideoCall, connectSocket, addSystemMessage, setInputValue, clearMessages]);
 
     const handleSendMessage = useCallback(() => {
         if (inputValue.trim() && status === "chatting") {
             const text = inputValue.trim();
             sendSocketMessage(text);
-            // Add "me" message locally
-            const newMessage: Message = {
-                id: uuidv4(),
-                text,
-                sender: "me",
-                timestamp: Date.now(),
-            };
-            setMessages(prev => [...prev, newMessage]);
-            setInputValue("");
-            sendSocketTyping(false); // Explicitly stop typing indicator
+            addUserMessage(text);
+            setInputValue(""); // Clear input after sending
+            sendSocketTyping(false); // Stop typing indicator
             inputRef.current?.focus();
         }
-    }, [inputValue, status, sendSocketMessage, sendSocketTyping]);
+    }, [inputValue, status, sendSocketMessage, addUserMessage, setInputValue, sendSocketTyping, inputRef]);
 
     const handleInputChange = useCallback((value: string) => {
         setInputValue(value);
-        // Debounce typing indicator logic? Or keep simple? Let's keep simple.
-        // sendSocketTyping(value.length > 0); // useChatManager handles the timeout logic
-    }, [sendSocketTyping]); // Remove sendSocketTyping if not called here directly
+    }, [setInputValue]);
 
     const handleTyping = useCallback((isTyping: boolean) => {
-         sendSocketTyping(isTyping);
-    },[sendSocketTyping]);
-
+        sendSocketTyping(isTyping);
+    }, [sendSocketTyping]);
 
     const handleToggleVideo = useCallback(() => {
         if (isWebRTCActive) {
             console.log("[ChatInterface] User stopping video call.");
-            stopWebRTCCall(true); // Stop call, notify hook/partner
+            stopVideoCall(true);
         } else if (status === 'chatting' && partnerId) {
             console.log("[ChatInterface] User starting video call.");
-            // Optionally add a system message like "Starting video..."
-            // addSystemMessage("Attempting to start video call...");
+            addSystemMessage("Attempting to start video call...");
             startVideoCall();
         } else if (status !== 'chatting') {
             toast.info("Video Call Disabled", {
                 description: "You must be connected to a partner to start video."
             });
         }
-    }, [isWebRTCActive, status, partnerId, startVideoCall, stopWebRTCCall]);
+    }, [isWebRTCActive, status, partnerId, startVideoCall, stopVideoCall, addSystemMessage]);
 
     // --- Effects ---
     useEffect(() => {
-        // Scroll to bottom on new messages or typing indicator change
         messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-    }, [messages, isPartnerTyping]);
+    }, [messages, isPartnerTyping, messagesEndRef]);
 
+    // --- Child Components ---
     const ChatHeader = ({ status, isWebRTCActive, canStartVideo, onStartChat, onNextChat, onEndChat, onToggleVideo }: ChatHeaderProps) => {
         const renderStatusIndicator = () => {
-            // ... (same logic as before)
             switch (status) {
                 case "idle": return <span className="text-muted-foreground flex items-center"><X className="w-4 h-4 mr-2 text-gray-500" />Idle</span>;
                 case "connecting": return <span className="flex items-center text-blue-500"><Loader2 className="w-4 h-4 mr-2 animate-spin" />Connecting...</span>;
@@ -248,7 +309,7 @@ export default function ChatInterface() {
 
         const renderMainActionButton = () => {
             const isBusy = status === 'connecting' || status === 'waiting';
-            const canInteract = status === 'chatting' || status === 'waiting'; // Can end/next if waiting
+            const canInteract = status === 'chatting' || status === 'waiting';
 
             if (status === 'idle' || status === 'disconnected' || status === 'error') {
                 return (
@@ -287,35 +348,35 @@ export default function ChatInterface() {
 
     const MessageArea = ({ messages, isPartnerTyping, status }: MessageAreaProps) => {
          const renderWelcomeOrStatusScreen = () => (
-             <div className="flex flex-col items-center justify-center h-full text-center p-4">          
-                          {status === 'idle' && (
-            <>
-                <div className="text-3xl font-bold bg-gradient-to-r from-indigo-500 to-purple-600 dark:from-indigo-400 dark:to-purple-500 bg-clip-text text-transparent pb-2 animate-fade-in">
-                    Welcome to WhimsyChat
-                </div>
-                <p className="text-muted-foreground mb-6 max-w-md animate-slide-in">
-                    Click "Start Chatting" to connect with a random stranger.
-                </p>
-            </>
-        )}
-         {status === 'disconnected' &&
-             <p className="mt-4 text-lg text-orange-600 animate-fade-in">
-                 Chat ended. Start a new one?
-             </p>
-         }
-         {status === 'error' &&
-             <p className="mt-4 text-lg text-destructive animate-fade-in">
-                 Connection error. Please try starting again. 
-             </p>
-         }
-        {status === 'connecting' && <p>Connecting...</p>}
-        {status === 'waiting' && <p>Searching for partner...</p>}
+             <div className="flex flex-col items-center justify-center h-full text-center p-4">
+                {status === 'idle' && (
+                    <>
+                        <div className="text-3xl font-bold bg-gradient-to-r from-indigo-500 to-purple-600 dark:from-indigo-400 dark:to-purple-500 bg-clip-text text-transparent pb-2 animate-fade-in">
+                            Welcome to WhimsyChat
+                        </div>
+                        <p className="text-muted-foreground mb-6 max-w-md animate-slide-in">
+                            Click "Start Chatting" to connect with a random stranger.
+                        </p>
+                    </>
+                )}
+                 {status === 'disconnected' &&
+                     <p className="mt-4 text-lg text-orange-600 animate-fade-in">
+                         Chat ended. Start a new one?
+                     </p>
+                 }
+                 {status === 'error' &&
+                     <p className="mt-4 text-lg text-destructive animate-fade-in">
+                         Connection error. Please try starting again.
+                     </p>
+                 }
+                 {status === 'connecting' && <div className="flex items-center text-blue-500"><Loader2 className="w-4 h-4 mr-2 animate-spin" />Connecting...</div>}
+                 {status === 'waiting' && <div className="flex items-center text-amber-500"><Loader2 className="w-4 h-4 mr-2 animate-spin" />Searching for partner...</div>}
              </div>
          );
 
         return (
             <div className="flex-grow overflow-y-auto p-4 space-y-2 relative">
-                {messages.length === 0 && (status === 'idle' || status === 'disconnected' || status === 'error') ? (
+                {messages.length === 0 && (status === 'idle' || status === 'disconnected' || status === 'error' || status === 'connecting' || status === 'waiting') ? (
                     renderWelcomeOrStatusScreen()
                 ) : (
                     <>
@@ -323,7 +384,7 @@ export default function ChatInterface() {
                             <ChatMessage key={message.id} message={message} />
                         ))}
                         {isPartnerTyping && status === "chatting" && (
-                            <div className="flex justify-start sticky bottom-1 left-4"> {/* Adjusted position slightly */}
+                            <div className="flex justify-start sticky bottom-1 left-4">
                                  <TypingIndicator />
                             </div>
                         )}
@@ -344,14 +405,14 @@ export default function ChatInterface() {
 
          const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
               onChange(e.target.value);
-              onTyping(e.target.value.length > 0); // Notify typing status on change
+              onTyping(e.target.value.length > 0);
          }
 
         return (
             <div className="p-3 border-t dark:border-gray-700 bg-background/90 dark:bg-gray-800/90 backdrop-blur-sm sticky bottom-0">
                 <div className="flex gap-2 items-center">
                     <Input
-                        ref={inputRef} // Keep ref here for focus management
+                        ref={inputRef}
                         value={value}
                         onChange={handleChange}
                         onKeyDown={handleKeyDown}
@@ -380,37 +441,49 @@ export default function ChatInterface() {
     };
 
      const VideoPanel = ({ localStream, remoteStream, isWebRTCActive, status, partnerId }: VideoPanelProps) => {
-         // ... (keep the JSX from the original component, passing props down)
          return (
-              <div className="hidden md:flex flex-col w-1/3 bg-muted/40 dark:bg-black/30">
+              <div className="hidden md:flex flex-col w-1/3 bg-muted/40 dark:bg-black/30 border-l dark:border-gray-700">
+                  {/* Remote Video */}
                   <div className="aspect-video bg-black relative overflow-hidden border-b dark:border-gray-700 group">
                       <VideoPlayer stream={remoteStream} muted={false} />
                       {!remoteStream && (
-                          <div className="absolute inset-0 flex items-center justify-center text-muted-foreground bg-black/60 text-sm">
-                             {status === 'chatting' ? (partnerId ? "Partner's Video" : "Waiting for Partner") : "Offline"}
+                          <div className="absolute inset-0 flex items-center justify-center text-muted-foreground bg-black/60 text-sm px-2 text-center">
+                             {status === 'chatting' ? (partnerId ? (isWebRTCActive ? "Waiting for partner's video..." : "Partner's Video Off") : "Waiting for Partner") : "Offline"}
                           </div>
                       )}
-                      {/* ... other overlays ... */}
+                       {remoteStream && (
+                          <div className="absolute top-2 left-2 bg-black/50 text-white p-1 rounded-full opacity-0 group-hover:opacity-100 transition-opacity">
+                               <Video className="w-4 h-4"/>
+                           </div>
+                       )}
                   </div>
+                  {/* Local Video */}
                   <div className="aspect-video bg-black relative overflow-hidden group">
                       <VideoPlayer stream={localStream} muted={true} />
                       {!localStream && (
-                          <div className="absolute inset-0 flex items-center justify-center text-muted-foreground bg-black/60 text-sm">
-                              {isWebRTCActive ? "Starting video..." : "Your Video Off"}
+                          <div className="absolute inset-0 flex items-center justify-center text-muted-foreground bg-black/60 text-sm px-2 text-center">
+                              {status === 'chatting' && isWebRTCActive ? "Starting your video..." : "Your Video Off"}
                           </div>
                       )}
-                       {/* ... other overlays ... */}
+                       {localStream && (
+                           <div className="absolute top-2 left-2 bg-black/50 text-white p-1 rounded-full opacity-0 group-hover:opacity-100 transition-opacity">
+                               <Video className="w-4 h-4"/>
+                           </div>
+                       )}
+                  </div>
+                  {/* Add some padding/info at the bottom if needed */}
+                  <div className="p-2 text-xs text-muted-foreground text-center border-t dark:border-gray-700">
+                      {isWebRTCActive ? "Video call active" : (status === 'chatting' ? "Video available" : "Video offline")}
                   </div>
               </div>
          );
      };
 
-
-    // --- Render Main Component ---
+    // --- Render Component ---
     return (
         <div className="flex h-full max-h-screen overflow-hidden bg-card text-card-foreground">
             {/* Left Panel: Chat */}
-            <div className="flex flex-col w-full md:w-2/3 border-r dark:border-gray-700">
+            <div className="flex flex-col w-full md:w-2/3">
                 <ChatHeader
                     status={status}
                     isWebRTCActive={isWebRTCActive}
@@ -429,7 +502,7 @@ export default function ChatInterface() {
                     value={inputValue}
                     onChange={handleInputChange}
                     onSend={handleSendMessage}
-                    onTyping={handleTyping} // Pass typing handler
+                    onTyping={handleTyping}
                     disabled={status !== "chatting"}
                     status={status}
                 />
