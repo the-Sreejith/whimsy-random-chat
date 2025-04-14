@@ -14,10 +14,8 @@ const io = new Server(httpServer, {
 });
 
 // --- Redis Setup ---
-// Use environment variable for Redis URL or fallback to default
-const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
-console.log(`Connecting to Redis at: ${redisUrl}`);
-const redis = createClient({ url: redisUrl });
+console.log(`Connecting to Redis`);
+const redis = createClient({ url: process.env.REDIS_URL });
 
 redis.on('error', (err) => console.error('Redis Client Error', err));
 
@@ -169,7 +167,7 @@ io.on('connection', async (socket) => {
     });
 });
 
-const PORT = process.env.PORT || 3001; // Use port 3001 to avoid conflict with potential frontend dev server
+const PORT = process.env.PORT || 3001; // Default to 3000 if not set
 httpServer.listen(PORT, () => {
-    console.log(`Socket server listening on port ${PORT}`);
+    console.log(`Socket server listening`);
 });
